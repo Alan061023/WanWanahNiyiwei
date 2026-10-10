@@ -1,78 +1,22 @@
 #!/usr/bin/env python3
-"""YOUR DRIVER GOES HERE.
+"""ROBORACER AUTONOMOUS DRIVER - FOLLOW THE GAP (FTG) ALGORITHM
 
-This is the node the judges run. Keep `driver` as the executable name and keep
-publishing to the two AutoDRIVE command topics; everything else is yours to
-change - rewrite this file completely if you want to.
-
---------------------------------------------------------------------------
-THIS TEMPLATE DOES NOT DRIVE
---------------------------------------------------------------------------
-It is wiring, not a driver. It connects to the simulator, subscribes to the
-sensors, and then publishes a slow constant throttle with the wheels straight.
-It will roll forward off the line and into the first thing in front of it.
-That is deliberate and it is the whole point: **there is no algorithm here and
-no algorithm is shipped anywhere else in this repository.** Writing one is the
-hackathon.
-
-What the template is good for is proving your setup works. If the car moves
-when you run it, then the image, the bridge, the QoS settings, the workspace
-and your commands are all correct, and every problem left is yours.
-
-    ros2 run team_driver driver
-    ros2 launch team_driver driver.launch.py
-
-`docs/04-algorithms.md` lists the approaches worth starting from - reactive
-ones that need nothing but the LiDAR, planners that follow a line, model-based
-control, and learned policies - with what each needs and where each breaks.
-Pick one and replace `plan()` below.
-
---------------------------------------------------------------------------
-THE CONTROL INTERFACE IS NOT A SPEED REQUEST
---------------------------------------------------------------------------
-AutoDRIVE takes a normalised throttle, not a target speed:
-
-    /autodrive/roboracer_1/throttle_command   Float32, [-1, 1]
-    /autodrive/roboracer_1/steering_command   Float32, [-1, 1]  ->  +-0.5236 rad
-
--1 is full reverse, 0 is coasting, +1 is full torque. There is no speed
-controller between you and the motor, so "go at 3 m/s" is a control problem you
-now own. Whatever algorithm you pick will decide a *target* speed; turning that
-into a throttle is a separate job, and it is worth several seconds a lap. See
-`docs/04-algorithms.md` §4.1.
-
---------------------------------------------------------------------------
-WHAT YOU MAY READ  (see docs/06-rules.md)
---------------------------------------------------------------------------
-    .../lidar            1080 beams over 270 deg, 0.06-10 m
-    .../imu              orientation, angular velocity, linear acceleration
-    .../left_encoder     wheel angle, 16 PPR x 120
-    .../right_encoder
-    .../front_camera     RGB image (headless runs do not produce one)
-    .../throttle         actuator feedback
-    .../steering
-    .../ips              ground-truth position - ALLOWED here, see below
-    .../odom             ground-truth pose and velocity - ALLOWED, RECOMMENDED
-    .../lap_count        .../lap_time  .../last_lap_time  .../best_lap_time
-    .../collision_count
-    /tf, /tf_static
-
-The AutoDRIVE competition rules mark the pose and race-telemetry topics
-"restricted": legal for development, not at race time. **The hackathon does not
-adopt that restriction for reading.** Every input above is yours to use during
-a scored run, ground-truth pose included. What stays restricted is *publishing*
-`/autodrive/reset_command`, which is the referee's (rule 31).
+This node implements a Follow-the-Gap algorithm for reactive high-speed
+obstacle avoidance and race track navigation.
 """
 
 import math
-
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
-                       QoSReliabilityPolicy)
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+)
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32
 from visualization_msgs.msg import Marker, MarkerArray
@@ -82,12 +26,7 @@ MAX_STEERING_RAD = 0.5236
 
 
 def devkit_qos() -> QoSProfile:
-    """Match the QoS the AutoDRIVE bridge publishes and subscribes with.
-
-    RELIABLE / KEEP_LAST(1) / VOLATILE. Get this wrong and the topics simply do
-    not connect: a BEST_EFFORT subscriber will never see a RELIABLE publisher's
-    messages, and `ros2 topic list` will still cheerfully show the topic.
-    """
+    """Match the QoS the AutoDRIVE bridge publishes and subscribes with."""
     return QoSProfile(
         durability=QoSDurabilityPolicy.VOLATILE,
         reliability=QoSReliabilityPolicy.RELIABLE,
@@ -101,15 +40,21 @@ class Driver(Node):
     def __init__(self):
         super().__init__('driver')
 
-        # Declared parameters can be retuned without editing code:
-        #   ros2 run team_driver driver --ros-args -p crawl_throttle:=0.3
-        # Add your own as you go; config/driver_params.yaml loads them.
+        # ROS 2 Parameters (Tunable via CLI or driver_params.yaml)
         self.declare_parameter('vehicle_ns', '/autodrive/roboracer_1')
-        self.declare_parameter('crawl_throttle', 0.12)    # [-1, 1], open loop
-        self.declare_parameter('max_range', 10.0)         # [m] clip the scan here
+        self.declare_parameter('max_range', 10.0)             # [m] clip scan max range
+        self.declare_parameter('fov_deg', 140.0)              # [deg] total front field of view
+        self.declare_parameter('bubble_radius', 0.45)         # [m] safety bubble around nearest obstacle
+        self.declare_parameter('max_speed_throttle', 0.35)    # [-1, 1] speed on straightaways
+        self.declare_parameter('min_speed_throttle', 0.15)    # [-1, 1] speed on sharp turns
+        self.declare_parameter('kp', 0.85)                    # Steering proportional gain
 
-        self.crawl_throttle = self.get_parameter('crawl_throttle').value
         self.max_range = self.get_parameter('max_range').value
+        self.fov_deg = self.get_parameter('fov_deg').value
+        self.bubble_radius = self.get_parameter('bubble_radius').value
+        self.max_speed_throttle = self.get_parameter('max_speed_throttle').value
+        self.min_speed_throttle = self.get_parameter('min_speed_throttle').value
+        self.kp = self.get_parameter('kp').value
 
         ns = str(self.get_parameter('vehicle_ns').value).rstrip('/')
         qos = devkit_qos()
@@ -122,89 +67,133 @@ class Driver(Node):
         self.create_subscription(Odometry, f'{ns}/odom', self.odom_callback, qos)
         self.create_subscription(Point, f'{ns}/ips', self.ips_callback, qos)
 
-        # Latest known pose and speed. Ground truth from the simulator, which
-        # the hackathon rules allow you to use - so use it.
+        # Telemetry state variables
         self.position = None      # (x, y) in the `world` frame
         self.yaw = 0.0            # [rad]
         self.speed = 0.0          # [m/s]
 
         self._marker_divisor = 0
-        self.get_logger().warn(
-            'team_driver is up, but this template has no driving logic: it will '
-            'crawl straight ahead until it hits something. Implement plan().')
+        self.get_logger().info('Follow-the-Gap Driver Initialized and Ready!')
 
-    # ------------------------------------------------------------------
-    # Where the car is. Free, accurate, and worth building on.
-    # ------------------------------------------------------------------
     def odom_callback(self, msg):
         self.position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         q = msg.pose.pose.orientation
-        self.yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
-                              1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self.yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        )
         self.speed = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
 
     def ips_callback(self, msg):
-        """Position alone, at the same rate. /odom carries this plus velocity."""
         self.position = (msg.x, msg.y)
 
-    # ------------------------------------------------------------------
-    # The control loop, once per LiDAR scan (40 Hz).
-    # ------------------------------------------------------------------
     def scan_callback(self, scan):
-        ranges, angles = self.preprocess(scan)
-        steering, throttle = self.plan(ranges, angles)
-        self.publish(steering, throttle)
+    ranges, angles = self.preprocess(scan)
+    steering, throttle = self.plan(ranges, angles)
+    self.publish(steering, throttle)
 
-        self._marker_divisor = (self._marker_divisor + 1) % 10
-        if self._marker_divisor == 0:
-            self.publish_marker(steering * MAX_STEERING_RAD)
+    self._marker_divisor = (self._marker_divisor + 1) % 10
+    if self._marker_divisor == 0:
+        self.publish_marker(steering * MAX_STEERING_RAD)
+        
+        # Log status every 10 frames using valid local variables (steering & throttle)
+        min_r = np.min(ranges) if len(ranges) > 0 else 0.0
+        max_r = np.max(ranges) if len(ranges) > 0 else 0.0
+        self.get_logger().info(
+            f"Min range: {min_r:.2f}m | Max range: {max_r:.2f}m | "
+            f"Steering: {steering:.2f} | Throttle: {throttle:.2f}"
+        )
 
     def preprocess(self, scan):
-        """Turn a raw scan into clean ranges plus the angle of each beam.
+    """Clean raw LiDAR scan ranges, crop to forward FOV, and construct beam angles."""
+    # 1. Safely determine max range limit
+    max_range = getattr(self, 'max_range', scan.range_max)
+    min_range = scan.range_min if scan.range_min > 0 else 0.0
 
-        Kept because every approach needs some version of it and the details
-        are fiddly rather than interesting: the LiDAR reports NaN and inf, and
-        arithmetic on those propagates silently through everything downstream.
-        """
-        ranges = np.asarray(scan.ranges, dtype=np.float64)
-        ranges = np.nan_to_num(ranges, nan=0.0, posinf=self.max_range, neginf=0.0)
-        ranges = np.clip(ranges, 0.0, self.max_range)
+    # 2. Convert raw ranges to float64 array
+    ranges = np.asarray(scan.ranges, dtype=np.float64)
 
-        angles = scan.angle_min + np.arange(len(ranges)) * scan.angle_increment
-        return ranges, angles
+    # 3. Replace inf and nan values with valid bounds
+    ranges = np.nan_to_num(ranges, nan=0.0, posinf=max_range, neginf=0.0)
+    ranges = np.clip(ranges, min_range, max_range)
+
+    # 4. Compute angle array for all beams
+    angles = scan.angle_min + np.arange(len(ranges)) * scan.angle_increment
+
+    # 5. Filter array to forward 180° FOV (-90° to +90° / -1.57 to +1.57 rad)
+    #    Prevents the car from trying to turn toward gaps behind or beside it.
+    fov_mask = (angles >= -1.57) & (angles <= 1.57)
+    ranges = ranges[fov_mask]
+    angles = angles[fov_mask]
+
+    return ranges, angles
 
     # ==================================================================
-    # THIS IS THE PART YOU WRITE.
+    # AUTONOMOUS DRIVING ALGORITHM (Follow the Gap)
     # ==================================================================
     def plan(self, ranges, angles):
-        """Decide what the car should do, given the latest scan.
+        """Decide steering and throttle using Follow-the-Gap logic."""
+        if len(ranges) == 0:
+            return 0.0, 0.0
 
-        Returns `(steering, throttle)`, both normalised to [-1, 1]. Steering
-        is a fraction of full lock (MAX_STEERING_RAD); throttle is torque, not
-        speed.
+        # 1. Mask field of view (FOV) to focus on forward driving area
+        half_fov = math.radians(self.fov_deg / 2.0)
+        fov_mask = (angles >= -half_fov) & (angles <= half_fov)
 
-        Right now it returns "straight ahead, slowly", which is not driving:
-        it ignores `ranges` entirely, so the car will hold its heading off the
-        line and put itself into the first barrier it meets. Replace the whole
-        method.
+        proc_ranges = np.copy(ranges)
+        proc_ranges[~fov_mask] = 0.0
 
-        You have more to work with than the scan. `self.position`, `self.yaw`
-        and `self.speed` are ground truth from /odom and are yours to use, and
-        nothing stops you subscribing to more topics, loading a map or a line
-        you computed offline, or running a policy you trained. See
-        docs/04-algorithms.md for the approaches and what each one needs.
-        """
-        return 0.0, self.crawl_throttle
+        if not np.any(proc_ranges > 0):
+            return 0.0, self.min_speed_throttle
 
-    # ------------------------------------------------------------------
-    # Output
-    # ------------------------------------------------------------------
+        # 2. Find the closest obstacle beam in the FOV
+        valid_ranges = np.where(proc_ranges > 0, proc_ranges, np.inf)
+        closest_idx = int(np.argmin(valid_ranges))
+        closest_dist = valid_ranges[closest_idx]
+
+        # 3. Apply safety bubble around the nearest obstacle point
+        angle_increment = angles[1] - angles[0] if len(angles) > 1 else 0.004
+        if closest_dist > 0.05:
+            bubble_angle = math.atan2(self.bubble_radius, closest_dist)
+            beam_radius = int(math.ceil(bubble_angle / abs(angle_increment)))
+
+            start_idx = max(0, closest_idx - beam_radius)
+            end_idx = min(len(proc_ranges), closest_idx + beam_radius + 1)
+            proc_ranges[start_idx:end_idx] = 0.0
+
+        # 4. Smooth scan data to filter single-beam noise
+        window_size = 5
+        kernel = np.ones(window_size) / window_size
+        smoothed_ranges = np.convolve(proc_ranges, kernel, mode='same')
+
+        # 5. Target the deepest gap point
+        best_idx = int(np.argmax(smoothed_ranges))
+        target_angle = angles[best_idx]
+
+        # 6. Calculate normalized steering output [-1.0, 1.0]
+        steering = self.kp * (target_angle / MAX_STEERING_RAD)
+        steering = float(np.clip(steering, -1.0, 1.0))
+
+        # 7. Calculate dynamic speed (slow down on sharp turns, accelerate on straights)
+        steering_severity = abs(steering)
+        front_beam_idx = len(proc_ranges) // 2
+        front_distance = ranges[front_beam_idx]
+
+        if front_distance < 0.5:
+            # Emergency crawl if barrier is close directly ahead
+            throttle = 0.05
+        else:
+            throttle = self.max_speed_throttle - (
+                steering_severity * (self.max_speed_throttle - self.min_speed_throttle)
+            )
+
+        return steering, float(throttle)
+
     def publish(self, steering, throttle):
         self.steering_pub.publish(Float32(data=float(np.clip(steering, -1.0, 1.0))))
         self.throttle_pub.publish(Float32(data=float(np.clip(throttle, -1.0, 1.0))))
 
     def publish_marker(self, target_angle):
-        """Draw where the car thinks it is going. Add /driver/markers in RViz."""
         marker = Marker()
         marker.header.frame_id = 'roboracer_1'
         marker.header.stamp = self.get_clock().now().to_msg()
