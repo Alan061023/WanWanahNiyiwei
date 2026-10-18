@@ -3,7 +3,7 @@
 ## Members
 | Tee Wei Loon | U2520461E | TEEW0010@e.ntu.edu.sg |
 | Soon Ming Yang | U2520271J | SOON0079@e.ntu.edu.sg |
-| Khoo Ding Feng | U2520411D | KHOO |
+| Khoo Ding Feng | U2520411D | KHOO0220@e.ntu.edu.sg |
 | Poh Shi Jin | U2622094H | SPOH017@e.ntu.edu.sg |
 | Tan Wei Hang | U2520350H | TANW0300@e.ntu.edu.sg | 
 
