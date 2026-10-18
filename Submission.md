@@ -55,12 +55,12 @@ evaluate.sh. A two-lap development run is not a substitute for the required
 10-lap result.
 
 | Best lap | 10-lap total | Collisions | Runs attempted |
-| --- | --- | --- | --- |
-| ... | ... | ... | ... |
+| 11.963 | 120.933 | 0 | 1 |
+| 12.048 | 121.767 | 0 | 2 |
 
 ### The machine that produced them
 | CPU | GPU | RAM | OS | Typical real-time factor |
-| --- | --- | --- | --- | --- |
+| Ryzen 7 | RTX 50700 | 16GB | Windows |  |
 | ... | ... | ... | ... | ... |
 
 The development run completed approximately 28.8-second laps with the tested
