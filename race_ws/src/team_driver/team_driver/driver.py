@@ -1,59 +1,5 @@
 #!/usr/bin/env python3
-"""Baseline driver: pure pursuit on the centreline, constant target speed.
-
-This is the node the judges run: `ros2 run team_driver driver`.
-
-    scan_callback (40 Hz)  ->  preprocess  ->  plan  ->  publish
-
-plan() steers with pure pursuit (pure_pursuit.py) along the path loaded from
-`path_file` - by default the organisers' traced centreline,
-maps/icra26_compete_centerline.csv - using ground-truth pose from /odom. A
-speed controller (speed_controller.py) turns a constant `v_target` into a
-throttle, and the target is capped to `safety_speed` when the LiDAR sees
-something closer than `safety_distance` straight ahead.
-
-Every tunable value is a ROS parameter, set in config/driver_params.yaml and
-defaulted in DEFAULT_PARAMS below; keep the two in step.
-
-    ros2 run team_driver driver
-    ros2 launch team_driver driver.launch.py
-
---------------------------------------------------------------------------
-THE CONTROL INTERFACE IS NOT A SPEED REQUEST
---------------------------------------------------------------------------
-AutoDRIVE takes a normalised throttle, not a target speed:
-
-    /autodrive/roboracer_1/throttle_command   Float32, [-1, 1]
-    /autodrive/roboracer_1/steering_command   Float32, [-1, 1]  ->  +-0.5236 rad
-
--1 is full reverse, 0 is coasting, +1 is full torque. There is no speed
-controller between you and the motor, so "go at 3 m/s" is a control problem you
-now own. Whatever algorithm you pick will decide a *target* speed; turning that
-into a throttle is a separate job, and it is worth several seconds a lap. See
-`docs/04-algorithms.md` §4.1.
-
---------------------------------------------------------------------------
-WHAT YOU MAY READ  (see docs/06-rules.md)
---------------------------------------------------------------------------
-    .../lidar            1080 beams over 270 deg, 0.06-10 m
-    .../imu              orientation, angular velocity, linear acceleration
-    .../left_encoder     wheel angle, 16 PPR x 120
-    .../right_encoder
-    .../front_camera     RGB image (headless runs do not produce one)
-    .../throttle         actuator feedback
-    .../steering
-    .../ips              ground-truth position - ALLOWED here, see below
-    .../odom             ground-truth pose and velocity - ALLOWED, RECOMMENDED
-    .../lap_count        .../lap_time  .../last_lap_time  .../best_lap_time
-    .../collision_count
-    /tf, /tf_static
-
-The AutoDRIVE competition rules mark the pose and race-telemetry topics
-"restricted": legal for development, not at race time. **The hackathon does not
-adopt that restriction for reading.** Every input above is yours to use during
-a scored run, ground-truth pose included. What stays restricted is *publishing*
-`/autodrive/reset_command`, which is the referee's (rule 31).
-"""
+"""Refined driver: high speed on straights, fast sweepers, and smooth 180-deg hairpin navigation."""
 
 import math
 import os
@@ -72,51 +18,47 @@ from visualization_msgs.msg import Marker, MarkerArray
 from team_driver.pure_pursuit import PurePursuit, load_path
 from team_driver.speed_controller import SpeedController
 
-# The steering command is normalised; this is what +-1.0 actually means.
 MAX_STEERING_RAD = 0.5236
 
-# Every tunable value, with its default. These defaults MUST match
-# config/driver_params.yaml: a judged run may start the node with no parameter
-# file at all (evaluate.launch.py only passes one if asked), and then these are
-# what drives the car.
 DEFAULT_PARAMS = {
     'vehicle_ns': '/autodrive/roboracer_1',
-    'max_range': 10.0,                  # [m] clip the scan here
+    'max_range': 10.0,
     # Path
     'path_file': '/hackathon/maps/icra26_compete_centerline.csv',
     # Pure pursuit
-    'lookahead_min': 0.6,               # [m]
-    'lookahead_gain': 0.15,             # [s]  ld = min + gain * speed
-    'lookahead_max': 1.5,               # [m]
+    'lookahead_min': 0.72,              # [m] stable tracking on straights and wide curves
+    'lookahead_hairpin': 0.44,          # [m] tight tracking strictly in the 180 hairpin apex
+    'lookahead_gain': 0.26,             # [s] ld = min + gain * speed
+    'lookahead_max': 2.2,               # [m]
     'wheelbase': 0.324,                 # [m]
-    'max_steer_rad': 0.5236,            # [rad] what steering_command = 1.0 means
-    # Speed
-    'v_target': 1.5,                    # [m/s] constant for now
-    'k_ff': 0.05,                       # [throttle per m/s] feed-forward
-    'kp': 0.10,                         # [throttle per m/s]
-    'ki': 0.05,                         # [throttle per m]
-    'integral_limit': 0.10,             # [throttle] max contribution of the I term
-    'throttle_min': 0.0,                # lift off, never brake, when slightly fast
-    'throttle_max': 0.30,
-    'overspeed_margin': 1.0,            # [m/s] this much too fast allows braking
-    'brake_throttle': -0.10,            # floor when badly too fast
-    # Safety
-    'safety_distance': 0.8,             # [m] LiDAR, +-safety_half_angle_deg ahead
-    'safety_half_angle_deg': 10.0,
-    'safety_speed': 0.5,                # [m/s] target speed cap when too close
+    'max_steer_rad': 0.5236,            # [rad]
+    # Speed Profile (Straights vs Sweeping Corners vs 180 Hairpin)
+    'v_target': 5.5,                    # [m/s] top speed on straightaways
+    'v_corner': 3.2,                    # [m/s] fast momentum through normal curves (was 2.6)
+    'v_hairpin': 1.9,                  # [m/s] smooth, brisk pace through the 180 hairpin (was 1.7)
+    'preview_dist': 2.8,                # [m] lookahead window for normal corners
+    'hairpin_preview_dist': 2.8,        # [m] lookahead window for hairpin detection
+    'corner_angle_thresh': 0.60,        # [rad] local bend threshold for normal curves
+    'hairpin_angle_thresh': 1.60,       # [rad] (~92 deg) ONLY triggers on the true 180 U-turn!
+    # Speed Controller (PI + Feed-Forward)
+    'k_ff': 0.13,
+    'kp': 0.14,
+    'ki': 0.04,
+    'integral_limit': 0.12,
+    'throttle_min': 0.0,
+    'throttle_max': 0.70,
+    'overspeed_margin': 1.25,           # [m/s] smooth coasting in curves; prevents brake-jerking
+    'brake_throttle': -0.22,            # decisive braking only when dropping from 5.0 to 1.8 m/s
+    # Safety (LiDAR obstacle ahead)
+    'safety_distance': 0.40,            # [m] emergency stop only; won't trigger on hairpin side ducts
+    'safety_half_angle_deg': 3.5,       # [deg] tight forward cone
+    'safety_speed': 1.4,
 }
 
-# Docker copies maps/ here too, in case /hackathon is not where the repo is.
 FALLBACK_MAP_DIR = '/opt/hackathon_maps'
 
 
 def devkit_qos() -> QoSProfile:
-    """Match the QoS the AutoDRIVE bridge publishes and subscribes with.
-
-    RELIABLE / KEEP_LAST(1) / VOLATILE. Get this wrong and the topics simply do
-    not connect: a BEST_EFFORT subscriber will never see a RELIABLE publisher's
-    messages, and `ros2 topic list` will still cheerfully show the topic.
-    """
     return QoSProfile(
         durability=QoSDurabilityPolicy.VOLATILE,
         reliability=QoSReliabilityPolicy.RELIABLE,
@@ -130,9 +72,6 @@ class Driver(Node):
     def __init__(self):
         super().__init__('driver')
 
-        # Declared parameters can be retuned without editing code:
-        #   ros2 run team_driver driver --ros-args -p v_target:=1.0
-        # config/driver_params.yaml sets them all.
         for name, default in DEFAULT_PARAMS.items():
             self.declare_parameter(name, default)
         p = {name: self.get_parameter(name).value for name in DEFAULT_PARAMS}
@@ -142,6 +81,14 @@ class Driver(Node):
         self.safety_distance = p['safety_distance']
         self.safety_half_angle = math.radians(p['safety_half_angle_deg'])
         self.safety_speed = p['safety_speed']
+        self.v_corner = p['v_corner']
+        self.preview_dist = p['preview_dist']
+        self.corner_angle_thresh = p['corner_angle_thresh']
+        self.v_hairpin = p['v_hairpin']
+        self.hairpin_preview_dist = p['hairpin_preview_dist']
+        self.hairpin_angle_thresh = p['hairpin_angle_thresh']
+        self.lookahead_min_default = p['lookahead_min']
+        self.lookahead_hairpin = p['lookahead_hairpin']
 
         path_file = self.resolve_path_file(p['path_file'])
         self.path = load_path(path_file)
@@ -171,16 +118,12 @@ class Driver(Node):
         self.create_subscription(LaserScan, f'{ns}/lidar', self.scan_callback, qos)
         self.create_subscription(Odometry, f'{ns}/odom', self.odom_callback, qos)
 
-        # Latest known pose and speed. Ground truth from the simulator, which
-        # the hackathon rules allow you to use - so use it. Only /odom is
-        # used: /ips reports the IPS sensor, 0.08 m ahead of the rear axle, and
-        # mixing the two would make the position jump between two points.
-        self.position = None      # (x, y) in the `world` frame
-        self.yaw = 0.0            # [rad]
-        self.speed = 0.0          # [m/s]
+        self.position = None
+        self.yaw = 0.0
+        self.speed = 0.0
 
-        self.last_stamp = None    # [s] of the previous scan, for the PI's dt
-        self.dt = 0.025           # [s]
+        self.last_stamp = None
+        self.dt = 0.025
         self.front_distance = self.max_range
         self.current_target = 0.0
         self._marker_divisor = 0
@@ -198,9 +141,6 @@ class Driver(Node):
             return fallback
         raise FileNotFoundError(f'path_file not found: {path_file}')
 
-    # ------------------------------------------------------------------
-    # Where the car is. Free, accurate, and worth building on.
-    # ------------------------------------------------------------------
     def odom_callback(self, msg):
         self.position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         q = msg.pose.pose.orientation
@@ -208,9 +148,6 @@ class Driver(Node):
                               1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         self.speed = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
 
-    # ------------------------------------------------------------------
-    # The control loop, once per LiDAR scan (40 Hz).
-    # ------------------------------------------------------------------
     def scan_callback(self, scan):
         self.dt = self.scan_dt(scan)
         ranges, angles = self.preprocess(scan)
@@ -229,70 +166,140 @@ class Driver(Node):
                 f'front {self.front_distance:.2f} m  idx {self.pursuit.nearest_idx}')
 
     def scan_dt(self, scan):
-        """Seconds since the previous scan, by the simulator's clock.
-
-        The bridge runs lock-step with the simulator, which need not keep up
-        with wall time, so the scan stamps are the honest clock. Anything
-        implausible falls back to the nominal 40 Hz.
-        """
         stamp = scan.header.stamp.sec + scan.header.stamp.nanosec * 1e-9
         dt = stamp - self.last_stamp if self.last_stamp is not None else 0.0
         self.last_stamp = stamp
         return dt if 0.0 < dt < 0.2 else 0.025
 
     def preprocess(self, scan):
-        """Turn a raw scan into clean ranges plus the angle of each beam.
-
-        Kept because every approach needs some version of it and the details
-        are fiddly rather than interesting: the LiDAR reports NaN and inf, and
-        arithmetic on those propagates silently through everything downstream.
-        """
         ranges = np.asarray(scan.ranges, dtype=np.float64)
         ranges = np.nan_to_num(ranges, nan=0.0, posinf=self.max_range, neginf=0.0)
         ranges = np.clip(ranges, 0.0, self.max_range)
-
         angles = scan.angle_min + np.arange(len(ranges)) * scan.angle_increment
         return ranges, angles
 
-    # ==================================================================
-    # THIS IS THE PART YOU WRITE.
-    # ==================================================================
-    def plan(self, ranges, angles):
-        """Pure pursuit on the centreline at a constant target speed.
+    def preview_heading_change(self, start_idx, preview_dist):
+        """Measure peak LOCAL curvature (over 5 waypoints ~0.6m) for normal corners."""
+        remaining = preview_dist
+        i = start_idx
+        n = self.pursuit.n
+        path = self.pursuit.path
+        seg_len = self.pursuit.seg_len
 
-        Returns `(steering, throttle)`, both normalised to [-1, 1]. Steering
-        is a fraction of full lock (MAX_STEERING_RAD); throttle is torque, not
-        speed.
-        """
-        self.current_target = 0.0
+        window = 5
+        max_local_bend = 0.0
+
+        while remaining > 0.0:
+            d1 = path[(i + 2) % n] - path[i]
+            d2 = path[(i + window + 2) % n] - path[(i + window) % n]
+            yaw1 = math.atan2(d1[1], d1[0])
+            yaw2 = math.atan2(d2[1], d2[0])
+            local_bend = abs(math.atan2(math.sin(yaw2 - yaw1),
+                                        math.cos(yaw2 - yaw1)))
+            if local_bend > max_local_bend:
+                max_local_bend = local_bend
+            remaining -= seg_len[i]
+            i = (i + 1) % n
+
+        return max_local_bend
+
+    def preview_total_bend(self, start_idx, preview_dist):
+        """Measure true net reversal angle over a short arc to isolate the 180 hairpin."""
+        remaining = preview_dist
+        i = start_idx
+        n = self.pursuit.n
+        path = self.pursuit.path
+        seg_len = self.pursuit.seg_len
+
+        d0 = path[(i + 2) % n] - path[i]
+        start_yaw = math.atan2(d0[1], d0[0])
+        max_net_bend = 0.0
+
+        while remaining > 0.0:
+            d = path[(i + 2) % n] - path[i]
+            seg_yaw = math.atan2(d[1], d[0])
+            net_diff = abs(math.atan2(math.sin(seg_yaw - start_yaw),
+                                      math.cos(seg_yaw - start_yaw)))
+            if net_diff > max_net_bend:
+                max_net_bend = net_diff
+            remaining -= seg_len[i]
+            i = (i + 1) % n
+
+        return max_net_bend
+
+    def plan(self, ranges, angles):
+        """Pure pursuit with smooth 3-tier speed profile and zero discontinuities."""
         if self.position is None:
-            return 0.0, 0.0     # no pose yet: stay put
+            self.current_target = 0.0
+            return 0.0, 0.0
 
         x, y = self.position
+        idx = self.pursuit.find_nearest(x, y)
+
+        # 1. Preview curvature
+        peak_local_bend = self.preview_heading_change(idx, self.preview_dist)
+        hairpin_bend = self.preview_total_bend(idx, self.hairpin_preview_dist)
+
+        # Continuous hairpin ratio (0.0 on normal curves, scaling to 1.0 ONLY in the 180 hairpin)
+        hp_ratio = float(np.clip(
+            (hairpin_bend - 1.25) / max(self.hairpin_angle_thresh - 1.25, 1e-3),
+            0.0, 1.0
+        ))
+
+        # Smooth lookahead interpolation (eliminates sudden steering jumps)
+        target_ld_min = self.lookahead_min_default - hp_ratio * (self.lookahead_min_default - self.lookahead_hairpin)
+        self.pursuit.lookahead_min += 0.25 * (target_ld_min - self.pursuit.lookahead_min)
+
         steering = self.pursuit.steer(x, y, self.yaw, self.speed)
 
-        # Safety: cap the speed if something is close straight ahead.
-        front = np.abs(angles) <= self.safety_half_angle
-        valid = ranges[front][ranges[front] > 0.06]     # 0 means "no reading"
-        self.front_distance = float(valid.min()) if valid.size else self.max_range
+        # 2. Normal corner speed profile (stays fast between v_target=5.0 and v_corner=3.3)
+        effective_bend = max(0.0, peak_local_bend - 0.18)
+        bend_ratio = min(effective_bend / max(self.corner_angle_thresh - 0.18, 1e-3), 1.0)
+        v_normal = self.v_target - (bend_ratio ** 1.3) * (self.v_target - self.v_corner)
 
-        v_target = self.v_target
+        # 3. Apply hairpin target ONLY proportional to hp_ratio
+        v_path = v_normal - hp_ratio * (v_normal - self.v_hairpin)
+
+        # 4. Smooth steering-dependent target speed
+        steer_mag = abs(steering)
+        v_steer = self.v_target - (steer_mag ** 1.8) * (self.v_target - self.v_hairpin)
+        raw_target = min(v_path, v_steer)
+
+        # 5. Steer-aligned LiDAR check
+        steer_angle_rad = steering * MAX_STEERING_RAD * 0.6
+        front = np.abs(angles - steer_angle_rad) <= self.safety_half_angle
+        valid = ranges[front][ranges[front] > 0.06]
+        self.front_distance = float(np.percentile(valid, 15)) if valid.size else self.max_range
+
         if self.front_distance < self.safety_distance:
-            v_target = min(v_target, self.safety_speed)
-        self.current_target = v_target
+            raw_target = min(raw_target, self.safety_speed)
 
-        throttle = self.speed_ctl.update(v_target, self.speed, self.dt)
+        # 6. Smooth target filter: brake decisively on entry (alpha=0.25), 
+        # but accelerate smoothly on exit (alpha=0.08) to prevent rear wheel spin
+        if self.current_target <= 0.0:
+            self.current_target = raw_target
+        else:
+            alpha = 0.25 if raw_target < self.current_target else 0.08
+            self.current_target += alpha * (raw_target - self.current_target)
+
+        # 7. Traction Control: dynamically scale throttle_max based on steering angle
+        # Full torque (1.0) when straight; capped to ~45% when wheels are turned hard
+        traction_limit = 1.0 - 0.55 * (steer_mag ** 1.5)
+        effective_throttle_max = self.speed_ctl.throttle_max * traction_limit
+
+        # Temporarily apply traction limit to speed controller output
+        orig_max = self.speed_ctl.throttle_max
+        self.speed_ctl.throttle_max = effective_throttle_max
+        throttle = self.speed_ctl.update(self.current_target, self.speed, self.dt)
+        self.speed_ctl.throttle_max = orig_max
+
         return steering, throttle
 
-    # ------------------------------------------------------------------
-    # Output
-    # ------------------------------------------------------------------
     def publish(self, steering, throttle):
         self.steering_pub.publish(Float32(data=float(np.clip(steering, -1.0, 1.0))))
         self.throttle_pub.publish(Float32(data=float(np.clip(throttle, -1.0, 1.0))))
 
     def publish_marker(self, target_angle):
-        """Draw where the car thinks it is going. Add /driver/markers in RViz."""
         marker = Marker()
         marker.header.frame_id = 'roboracer_1'
         marker.header.stamp = self.get_clock().now().to_msg()
@@ -307,7 +314,6 @@ class Driver(Node):
         array = MarkerArray()
         array.markers.append(marker)
 
-        # The path being followed, as a closed loop in the world frame.
         path = Marker()
         path.header.frame_id = 'world'
         path.header.stamp = marker.header.stamp
@@ -322,7 +328,6 @@ class Driver(Node):
                        for px, py in np.vstack([self.path, self.path[:1]])]
         array.markers.append(path)
 
-        # Where pure pursuit is aiming.
         if self.pursuit.lookahead_point is not None:
             target = Marker()
             target.header.frame_id = 'world'
