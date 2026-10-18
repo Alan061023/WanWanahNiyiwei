@@ -44,3 +44,10 @@ rosbag2_*/
 
 # Written by the CI integrity step if it is ever run inside the checkout
 integrity.txt
+# Colcon and ROS 2 build directories
+build/
+install/
+log/
+race_ws/build/
+race_ws/install/
+race_ws/log/
