@@ -60,8 +60,7 @@ evaluate.sh. A two-lap development run is not a substitute for the required
 
 ### The machine that produced them
 | CPU | GPU | RAM | OS | Typical real-time factor |
-| Ryzen 7 | RTX 50700 | 16GB | Windows |  |
-| ... | ... | ... | ... | ... |
+| Ryzen 7 | RTX 50700 | 16GB | Windows | 1.007 |
 
 The development run completed approximately 28.8-second laps with the tested
 speed setting. That number is kept as development evidence only; the official
