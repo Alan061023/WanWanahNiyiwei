@@ -55,8 +55,8 @@ evaluate.sh. A two-lap development run is not a substitute for the required
 10-lap result.
 
 | Best lap | 10-lap total | Collisions | Runs attempted |
-| 11.963 | 120.933 | 0 | 1 |
-| 12.048 | 121.767 | 0 | 2 |
+[WanWanahNiyiwei__20261018T150144Z.json](https://github.com/user-attachments/files/33631350/WanWanahNiyiwei__20261018T150144Z.json)
+[WanWanahNiyiwei__20261018T151244Z.json](https://github.com/user-attachments/files/33631352/WanWanahNiyiwei__20261018T151244Z.json)
 
 ### The machine that produced them
 | CPU | GPU | RAM | OS | Typical real-time factor |
