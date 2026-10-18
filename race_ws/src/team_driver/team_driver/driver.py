@@ -26,31 +26,31 @@ DEFAULT_PARAMS = {
     # Path
     'path_file': '/hackathon/maps/icra26_compete_centerline.csv',
     # Pure pursuit
-    'lookahead_min': 0.72,              # [m] stable tracking on straights and wide curves
-    'lookahead_hairpin': 0.44,          # [m] tight tracking strictly in the 180 hairpin apex
-    'lookahead_gain': 0.26,             # [s] ld = min + gain * speed
-    'lookahead_max': 2.2,               # [m]
+    'lookahead_min': 0.75,              # [m] stable tracking on straights and wide curves
+    'lookahead_hairpin': 0.4,          # [m] tight tracking strictly in the 180 hairpin apex
+    'lookahead_gain': 0.65,             # [s] ld = min + gain * speed #was 0.65
+    'lookahead_max': 2.4,               # [m]
     'wheelbase': 0.324,                 # [m]
-    'max_steer_rad': 0.5236,            # [rad]
+    'max_steer_rad': 0.5236,            # [rad] #0.5236
     # Speed Profile (Straights vs Sweeping Corners vs 180 Hairpin)
-    'v_target': 5.5,                    # [m/s] top speed on straightaways
-    'v_corner': 3.2,                    # [m/s] fast momentum through normal curves (was 2.6)
-    'v_hairpin': 1.9,                  # [m/s] smooth, brisk pace through the 180 hairpin (was 1.7)
+    'v_target': 5.7,                    # [m/s] top speed on straightaways
+    'v_corner': 3.4,                    # [m/s] fast momentum through normal curves (was 2.6)
+    'v_hairpin': 2,                  # [m/s] smooth, brisk pace through the 180 hairpin (was 2)
     'preview_dist': 2.8,                # [m] lookahead window for normal corners
-    'hairpin_preview_dist': 2.8,        # [m] lookahead window for hairpin detection
+    'hairpin_preview_dist': 3,        # [m] lookahead window for hairpin detection
     'corner_angle_thresh': 0.60,        # [rad] local bend threshold for normal curves
     'hairpin_angle_thresh': 1.60,       # [rad] (~92 deg) ONLY triggers on the true 180 U-turn!
     # Speed Controller (PI + Feed-Forward)
     'k_ff': 0.13,
-    'kp': 0.14,
+    'kp': 0.2, #0.2
     'ki': 0.04,
     'integral_limit': 0.12,
     'throttle_min': 0.0,
     'throttle_max': 0.70,
-    'overspeed_margin': 1.25,           # [m/s] smooth coasting in curves; prevents brake-jerking
+    'overspeed_margin': 1.2,           # [m/s] smooth coasting in curves; prevents brake-jerking
     'brake_throttle': -0.22,            # decisive braking only when dropping from 5.0 to 1.8 m/s
     # Safety (LiDAR obstacle ahead)
-    'safety_distance': 0.40,            # [m] emergency stop only; won't trigger on hairpin side ducts
+    'safety_distance': 0.50,            # [m] emergency stop only; won't trigger on hairpin side ducts
     'safety_half_angle_deg': 3.5,       # [deg] tight forward cone
     'safety_speed': 1.4,
 }
